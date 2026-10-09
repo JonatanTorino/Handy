@@ -110,6 +110,18 @@ handy --debug                   # Enable debug mode with verbose logging
 handy --help                    # Show all available flags
 ```
 
+**Headless file transcription** (runs its own process, prints the result and exits; the model must already be downloaded):
+
+```bash
+handy --list-models                              # Model ids (✓ = installed)
+handy -f meeting.mp3 --model <id> --json          # One JSON line per file
+handy -f a.wav b.m4a c.flac --model <id> --output-dir out/   # Batch: model loaded once, writes out/<name>.txt
+```
+
+`--transcribe-file` accepts WAV (any rate/channels), MP3, M4A/AAC, FLAC and OGG/Vorbis. Opus (e.g. WhatsApp voice notes) is not supported; convert it with ffmpeg first. Exit code: `0` all ok, `1` at least one transcription failed, `2` bad input or usage. Language, custom words and translation come from the app's settings.
+
+For folder-based, idempotent batch runs on Windows (convert with ffmpeg → archive originals → one transcript folder per model), see [`scripts/transcribe-batch.ps1`](scripts/transcribe-batch.ps1) (`Get-Help .\scripts\transcribe-batch.ps1 -Full`).
+
 Flags can be combined for autostart scenarios:
 
 ```bash

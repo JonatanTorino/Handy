@@ -28,11 +28,19 @@ pub struct CliArgs {
     #[arg(long)]
     pub debug: bool,
 
-    /// Transcribe this WAV (16 kHz mono) headlessly and exit. Runs the same
-    /// batch transcription path as the app — no mic, no VAD, no download
-    /// (the model must already be installed).
-    #[arg(short = 'f', long, value_name = "WAV")]
-    pub transcribe_file: Option<PathBuf>,
+    /// Transcribe these audio files headlessly and exit (WAV, MP3, M4A/AAC,
+    /// FLAC, OGG/Vorbis; any sample rate or channel count). The model is
+    /// loaded once for the whole list. Runs the same batch transcription path
+    /// as the app — no mic, no VAD, no download (the model must already be
+    /// installed). A failed file is reported and the rest still run.
+    #[arg(short = 'f', long, value_name = "AUDIO", num_args = 1..)]
+    pub transcribe_file: Vec<PathBuf>,
+
+    /// With --transcribe-file: write each transcript as UTF-8 to
+    /// `<DIR>/<file stem>.txt` (created if missing). Files are written
+    /// atomically, so a crash never leaves a truncated transcript behind.
+    #[arg(long, value_name = "DIR", requires = "transcribe_file")]
+    pub output_dir: Option<PathBuf>,
 
     /// Model id to load for --transcribe-file (default: the selected model).
     #[arg(long)]
@@ -57,7 +65,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "N")]
     pub repeat: Option<usize>,
 
-    /// Emit --transcribe-file results as JSON.
+    /// Emit --transcribe-file results as JSON, one object per line per file.
     #[arg(long)]
     pub json: bool,
 }

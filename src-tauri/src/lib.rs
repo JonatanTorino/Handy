@@ -449,7 +449,7 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
                 println!("  {}", d);
             }
         }
-        if args.transcribe_file.is_none() {
+        if args.transcribe_file.is_empty() {
             return 0;
         }
     }
@@ -490,47 +490,14 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
                 );
             }
         }
-        if args.transcribe_file.is_none() {
+        if args.transcribe_file.is_empty() {
             return 0;
         }
     }
 
-    let Some(wav) = args.transcribe_file.clone() else {
+    if args.transcribe_file.is_empty() {
         return 0;
-    };
-
-    // read_wav_samples reads 16-bit int samples and does no validation; the app
-    // only ever saves 16 kHz mono 16-bit PCM, so reject anything else rather than
-    // transcribe garbage / mis-time / mis-decode.
-    match hound::WavReader::open(&wav) {
-        Ok(reader) => {
-            let spec = reader.spec();
-            if spec.sample_rate != 16_000
-                || spec.channels != 1
-                || spec.bits_per_sample != 16
-                || spec.sample_format != hound::SampleFormat::Int
-            {
-                eprintln!(
-                    "error: expected 16 kHz mono 16-bit PCM WAV, got {} Hz / {} ch / {}-bit {:?}",
-                    spec.sample_rate, spec.channels, spec.bits_per_sample, spec.sample_format
-                );
-                return 2;
-            }
-        }
-        Err(e) => {
-            eprintln!("error: cannot open {}: {}", wav.display(), e);
-            return 2;
-        }
     }
-
-    let samples = match crate::audio_toolkit::read_wav_samples(&wav) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to read {}: {}", wav.display(), e);
-            return 2;
-        }
-    };
-    let audio_secs = samples.len() as f64 / 16_000.0;
 
     let tm = app.state::<Arc<TranscriptionManager>>();
 
@@ -552,7 +519,14 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         None => "settings".to_string(),
     };
 
-    // Cold load (timed).
+    if let Some(dir) = &args.output_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("error: cannot create {}: {}", dir.display(), e);
+            return 2;
+        }
+    }
+
+    // Cold load (timed), once for the whole batch.
     let load_start = Instant::now();
     if let Err(e) = tm.load_model_with_device(&model_id, device_index) {
         eprintln!("error: load_model('{}') failed: {}", model_id, e);
@@ -562,64 +536,200 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     let bound_backend = tm.current_backend();
 
     let runs = args.repeat.unwrap_or(1).max(1);
-    let mut times_ms: Vec<u64> = Vec::new();
+    let multiple = args.transcribe_file.len() > 1;
+    let mut written_stems = std::collections::HashSet::new();
+    let mut input_failures = 0usize;
+    let mut runtime_failures = 0usize;
+
+    for path in &args.transcribe_file {
+        let result = transcribe_headless_file(
+            &tm,
+            path,
+            &model_id,
+            device_index,
+            runs,
+            args.output_dir.as_deref(),
+            &mut written_stems,
+        );
+        let out = match result {
+            Ok(out) => out,
+            Err(failure) => {
+                let message = match &failure {
+                    HeadlessFailure::Input(m) => {
+                        input_failures += 1;
+                        m
+                    }
+                    HeadlessFailure::Runtime(m) => {
+                        runtime_failures += 1;
+                        m
+                    }
+                };
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "file": path,
+                            "model": model_id,
+                            "error": message,
+                        })
+                    );
+                } else {
+                    eprintln!("error: {}: {}", path.display(), message);
+                }
+                continue;
+            }
+        };
+
+        let best_ms = out.times_ms.iter().copied().min().unwrap_or(0);
+        let rtf = if best_ms > 0 {
+            out.audio_secs / (best_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "file": path,
+                    "model": model_id,
+                    "requested_device": requested_device,
+                    "bound_backend": bound_backend,
+                    "audio_secs": out.audio_secs,
+                    "load_ms": load_ms,
+                    "transcribe_ms": out.times_ms,
+                    "best_ms": best_ms,
+                    "rtf": rtf,
+                    "output_file": out.output_file,
+                    "text": out.text,
+                })
+            );
+        } else {
+            let file_prefix = if multiple {
+                format!("file={} ", path.display())
+            } else {
+                String::new()
+            };
+            println!(
+                "{}model={} device={} backend={} audio={:.2}s load={}ms best={}ms rtf={:.2}x",
+                file_prefix,
+                model_id,
+                requested_device,
+                bound_backend.as_deref().unwrap_or("?"),
+                out.audio_secs,
+                load_ms,
+                best_ms,
+                rtf,
+            );
+            println!("text: {}", out.text);
+        }
+    }
+
+    // Runtime failures outrank bad inputs so a broken engine is never
+    // mistaken for a bad file.
+    if runtime_failures > 0 {
+        1
+    } else if input_failures > 0 {
+        2
+    } else {
+        0
+    }
+}
+
+/// Why one file of a `--transcribe-file` batch failed. `Input` maps to exit
+/// code 2 (bad file/usage), `Runtime` to exit code 1.
+enum HeadlessFailure {
+    Input(String),
+    Runtime(String),
+}
+
+struct HeadlessFileOutcome {
+    audio_secs: f64,
+    times_ms: Vec<u64>,
+    text: String,
+    output_file: Option<std::path::PathBuf>,
+}
+
+/// Decode, transcribe (`runs` times) and optionally persist one file of a
+/// `--transcribe-file` batch. `written_stems` guards `--output-dir` against two
+/// inputs (e.g. `a.wav` and `a.mp3`) silently overwriting each other's text.
+fn transcribe_headless_file(
+    tm: &TranscriptionManager,
+    path: &std::path::Path,
+    model_id: &str,
+    device_index: Option<usize>,
+    runs: usize,
+    output_dir: Option<&std::path::Path>,
+    written_stems: &mut std::collections::HashSet<std::ffi::OsString>,
+) -> Result<HeadlessFileOutcome, HeadlessFailure> {
+    use std::time::Instant;
+
+    let output_target = match output_dir {
+        Some(dir) => {
+            let stem = path.file_stem().ok_or_else(|| {
+                HeadlessFailure::Input("cannot derive an output name".to_string())
+            })?;
+            if written_stems.contains(stem) {
+                return Err(HeadlessFailure::Input(format!(
+                    "another input in this batch already wrote {}.txt",
+                    stem.to_string_lossy()
+                )));
+            }
+            let mut name = stem.to_os_string();
+            name.push(".txt");
+            Some((stem.to_os_string(), dir.join(name)))
+        }
+        None => None,
+    };
+
+    let samples = crate::audio_toolkit::decode_audio_file(path)
+        .map_err(|e| HeadlessFailure::Input(format!("{:#}", e)))?;
+    let audio_secs = samples.len() as f64 / 16_000.0;
+
+    let mut times_ms: Vec<u64> = Vec::with_capacity(runs);
     let mut text = String::new();
     for i in 0..runs {
         // If the model's unload-timeout is "Immediately", transcribe() unloads
-        // the engine after each run; reload (untimed) so repeats keep working
-        // and the inference timing below stays clean.
+        // the engine after each run; reload (untimed) so repeats and the next
+        // file keep working and the inference timing below stays clean.
         if !tm.is_model_loaded() {
-            if let Err(e) = tm.load_model_with_device(&model_id, device_index) {
-                eprintln!("error: reload before run {} failed: {}", i + 1, e);
-                return 1;
-            }
+            tm.load_model_with_device(model_id, device_index)
+                .map_err(|e| {
+                    HeadlessFailure::Runtime(format!("reload before run {} failed: {}", i + 1, e))
+                })?;
         }
         let t = Instant::now();
-        match tm.transcribe(samples.clone()) {
-            Ok(out) => text = out,
-            Err(e) => {
-                eprintln!("error: transcribe failed: {}", e);
-                return 1;
-            }
-        }
+        text = tm
+            .transcribe(samples.clone())
+            .map_err(|e| HeadlessFailure::Runtime(format!("transcribe failed: {}", e)))?;
         times_ms.push(t.elapsed().as_millis() as u64);
     }
-    let best_ms = times_ms.iter().copied().min().unwrap_or(0);
-    let rtf = if best_ms > 0 {
-        audio_secs / (best_ms as f64 / 1000.0)
-    } else {
-        0.0
+
+    let output_file = match output_target {
+        Some((stem, target)) => {
+            // Write-then-rename: a crash mid-write must not leave a truncated
+            // transcript that a "skip if it exists" caller would trust.
+            let mut tmp_name = target.as_os_str().to_os_string();
+            tmp_name.push(".tmp");
+            let tmp = std::path::PathBuf::from(tmp_name);
+            std::fs::write(&tmp, &text)
+                .and_then(|_| std::fs::rename(&tmp, &target))
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    HeadlessFailure::Runtime(format!("cannot write {}: {}", target.display(), e))
+                })?;
+            written_stems.insert(stem);
+            Some(target)
+        }
+        None => None,
     };
 
-    if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "model": model_id,
-                "requested_device": requested_device,
-                "bound_backend": bound_backend,
-                "audio_secs": audio_secs,
-                "load_ms": load_ms,
-                "transcribe_ms": times_ms,
-                "best_ms": best_ms,
-                "rtf": rtf,
-                "text": text,
-            })
-        );
-    } else {
-        println!(
-            "model={} device={} backend={} audio={:.2}s load={}ms best={}ms rtf={:.2}x",
-            model_id,
-            requested_device,
-            bound_backend.as_deref().unwrap_or("?"),
-            audio_secs,
-            load_ms,
-            best_ms,
-            rtf,
-        );
-        println!("text: {}", text);
-    }
-    0
+    Ok(HeadlessFileOutcome {
+        audio_secs,
+        times_ms,
+        text,
+        output_file,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -788,7 +898,7 @@ pub fn run(cli_args: CliArgs) {
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
     let headless_mode =
-        cli_args.transcribe_file.is_some() || cli_args.list_devices || cli_args.list_models;
+        !cli_args.transcribe_file.is_empty() || cli_args.list_devices || cli_args.list_models;
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
